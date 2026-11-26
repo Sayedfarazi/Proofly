@@ -64,7 +64,7 @@ jobs:
           ditto -x -k dist/Proofly.zip "$RUNNER_TEMP/verify"
           app="$RUNNER_TEMP/verify/Proofly.app"
           codesign --verify --deep --strict "$app"
-          lipo -verify_arch arm64 "$app/Contents/MacOS/Proofly"
+          lipo "$app/Contents/MacOS/Proofly" -verify_arch arm64
           cmp Sources/Proofly/Info.plist "$app/Contents/Info.plist"
           cmp LICENSE "$app/Contents/Resources/LICENSE"
           test -s "$app/Contents/Resources/Proofly.icns"
