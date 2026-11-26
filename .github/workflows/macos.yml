@@ -1,0 +1,107 @@
+name: Build and release Proofly
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+    paths:
+      - 'Sources/**'
+      - 'Designs/**'
+      - 'Package.swift'
+      - 'Scripts/build-app.sh'
+      - 'Scripts/build-icons.sh'
+      - 'Scripts/package.sh'
+      - 'LICENSE'
+      - '.github/workflows/macos.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build and verify macOS app
+    runs-on: macos-26
+    timeout-minutes: 25
+    outputs:
+      release_tag: ${{ steps.version.outputs.release_tag }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Determine release version
+        id: version
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: |
+          plist=Sources/Proofly/Info.plist
+          version=$(plutil -extract CFBundleShortVersionString raw -o - "$plist")
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Expected a major.minor.patch app version"
+            exit 1
+          fi
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            if [[ "$GITHUB_REF_NAME" != "v$version" ]]; then
+              echo "::error::The tag must match the app version v$version"
+              exit 1
+            fi
+          elif [[ "$BEFORE" != 0000000000000000000000000000000000000000 ]]; then
+            previous=$(git show "$BEFORE:$plist" | plutil -extract CFBundleShortVersionString raw -o - -)
+            if [[ "$previous" == "$version" ]]; then
+              echo "App version unchanged. Verifying the build only."
+              exit 0
+            fi
+          fi
+          echo "release_tag=v$version" >> "$GITHUB_OUTPUT"
+
+      - name: Build and verify release ZIP
+        run: |
+          bash Scripts/build-app.sh
+          bash Scripts/package.sh
+          zips=(dist/Proofly-*-build*.zip)
+          mv "${zips[0]}" dist/Proofly.zip
+          ditto -x -k dist/Proofly.zip "$RUNNER_TEMP/verify"
+          app="$RUNNER_TEMP/verify/Proofly.app"
+          codesign --verify --deep --strict "$app"
+          lipo -verify_arch arm64 "$app/Contents/MacOS/Proofly"
+          cmp Sources/Proofly/Info.plist "$app/Contents/Info.plist"
+          cmp LICENSE "$app/Contents/Resources/LICENSE"
+          test -s "$app/Contents/Resources/Proofly.icns"
+          test -s "$app/Contents/Resources/MenuBarIconTemplate.png"
+
+      - name: Save verified ZIP for publication
+        if: steps.version.outputs.release_tag != ''
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: proofly-macos
+          path: dist/Proofly.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    if: needs.build.outputs.release_tag != ''
+    concurrency: release-${{ needs.build.outputs.release_tag }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: proofly-macos
+
+      - name: Publish Proofly.zip
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.build.outputs.release_tag }}
+        run: |
+          if gh release view "$TAG" --json isDraft,assets \
+              --jq '(.isDraft == false) and any(.assets[]; .name == "Proofly.zip")' | grep -qx true; then
+            echo "Release $TAG already contains Proofly.zip."
+            exit 0
+          fi
+          gh release create "$TAG" Proofly.zip --target "$GITHUB_SHA" \
+            --title "Proofly $TAG" --generate-notes
